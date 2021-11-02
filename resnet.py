@@ -1,174 +1,228 @@
+# Coder: Wenxin Xu
+# Github: https://github.com/wenxinxu/resnet_in_tensorflow
+# ==============================================================================
 '''
-Properly implemented ResNet-s for CIFAR10 as described in paper [1].
-
-The implementation and structure of this file is hugely influenced by [2]
-which is implemented for ImageNet and doesn't have option A for identity.
-Moreover, most of the implementations on the web is copy-paste from
-torchvision's resnet and has wrong number of params.
-
-Proper ResNet-s for CIFAR10 (for fair comparision and etc.) has following
-number of layers and parameters:
-
-name      | layers | params
-ResNet20  |    20  | 0.27M
-ResNet32  |    32  | 0.46M
-ResNet44  |    44  | 0.66M
-ResNet56  |    56  | 0.85M
-ResNet110 |   110  |  1.7M
-ResNet1202|  1202  | 19.4m
-
-which this implementation indeed has.
-
-Reference:
-[1] Kaiming He, Xiangyu Zhang, Shaoqing Ren, Jian Sun
-    Deep Residual Learning for Image Recognition. arXiv:1512.03385
-[2] https://github.com/pytorch/vision/blob/master/torchvision/models/resnet.py
-
-If you use this implementation in you work, please don't forget to mention the
-author, Yerlan Idelbayev.
+This is the resnet structure
 '''
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.nn.init as init
-
-from torch.autograd import Variable
-
-# __all__ = ['ResNet', 'resnet20', 'resnet32', 'resnet44', 'resnet56', 'resnet110', 'resnet1202']
-__all__ = ['ResNet',  'resnet32']
+import numpy as np
+from hyper_parameters import *
 
 
-def _weights_init(m):
-    classname = m.__class__.__name__
-    #print(classname)
-    if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
-        init.kaiming_normal_(m.weight)
+BN_EPSILON = 0.001
 
-class LambdaLayer(nn.Module):
-    def __init__(self, lambd):
-        super(LambdaLayer, self).__init__()
-        self.lambd = lambd
-
-    def forward(self, x):
-        return self.lambd(x)
+def activation_summary(x):
+    '''
+    :param x: A Tensor
+    :return: Add histogram summary and scalar summary of the sparsity of the tensor
+    '''
+    tensor_name = x.op.name
+    tf.summary.histogram(tensor_name + '/activations', x)
+    tf.summary.scalar(tensor_name + '/sparsity', tf.nn.zero_fraction(x))
 
 
-class BasicBlock(nn.Module):
-    expansion = 1
+def create_variables(name, shape, initializer=tf.contrib.layers.xavier_initializer(), is_fc_layer=False):
+    '''
+    :param name: A string. The name of the new variable
+    :param shape: A list of dimensions
+    :param initializer: User Xavier as default.
+    :param is_fc_layer: Want to create fc layer variable? May use different weight_decay for fc
+    layers.
+    :return: The created variable
+    '''
+    
+    ## TODO: to allow different weight decay to fully connected layer and conv layer
+    if is_fc_layer is True:
+        regularizer = tf.contrib.layers.l2_regularizer(scale=FLAGS.weight_decay)
+    else:
+        regularizer = tf.contrib.layers.l2_regularizer(scale=FLAGS.weight_decay)
 
-    def __init__(self, in_planes, planes, stride=1, option='A'):
-        super(BasicBlock, self).__init__()
-        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_planes != planes:
-            if option == 'A':
-                """
-                For CIFAR10 ResNet paper uses option A.
-                """
-                self.shortcut = LambdaLayer(lambda x:
-                                            F.pad(x[:, :, ::2, ::2], (0, 0, 0, 0, planes//4, planes//4), "constant", 0))
-            elif option == 'B':
-                self.shortcut = nn.Sequential(
-                     nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
-                     nn.BatchNorm2d(self.expansion * planes)
-                )
-
-    def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
-        out = F.relu(out)
-        return out
+    new_variables = tf.get_variable(name, shape=shape, initializer=initializer,
+                                    regularizer=regularizer)
+    return new_variables
 
 
-class ResNet(nn.Module):
-    def __init__(self, block, num_blocks, num_classes=10):
-        super(ResNet, self).__init__()
-        self.in_planes = 16
+def output_layer(input_layer, num_labels):
+    '''
+    :param input_layer: 2D tensor
+    :param num_labels: int. How many output labels in total? (10 for cifar10 and 100 for cifar100)
+    :return: output layer Y = WX + B
+    '''
+    input_dim = input_layer.get_shape().as_list()[-1]
+    fc_w = create_variables(name='fc_weights', shape=[input_dim, num_labels], is_fc_layer=True,
+                            initializer=tf.uniform_unit_scaling_initializer(factor=1.0))
+    fc_b = create_variables(name='fc_bias', shape=[num_labels], initializer=tf.zeros_initializer())
 
-        #first fully connected conv layer
-        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(16)
-
-        #Using resnet32, we have 3 layers of 5 residual blocks
-        self.layer1 = self._make_layer(block, 16, num_blocks[0], stride=1) # make_layer(BasicBlock, planes = 16, num_blocks = 5, stride = 1)
-        self.layer2 = self._make_layer(block, 32, num_blocks[1], stride=2) # make_layer(BasicBlock, planes = 32, num_blocks = 5, stride = 2)
-        self.layer3 = self._make_layer(block, 64, num_blocks[2], stride=2) # make_layer(BasicBlock, planes = 64, num_blocks = 5, stride = 2)
-        self.linear = nn.Linear(64, num_classes)
-
-        self.apply(_weights_init)
-
-    def _make_layer(self, block, planes, num_blocks, stride):
-        #first pass stride = 1, strides = [1] + [1] * (4) = [1,1,1,1,1]
-        #second pass stride = 2, strides = [2] + [1,1,1,1] = [2,1,1,1,1]
-        #third pass stride = 2, strides = [2,1,1,1,1]
-        strides = [stride] + [1]*(num_blocks-1)
-        layers = []
-
-        #will iterate 5 times for resnet-32
-        for stride in strides:
-            layers.append(block(self.in_planes, planes, stride)) 
-            self.in_planes = planes * block.expansion
-
-        return nn.Sequential(*layers)
-
-        #on first pass, in_planes = 16 (input size)
-        # layers.append(BasicBlock(inplane = 16, planes = 16, 1)) => self.in_planes = planes = 16 => repeat 4 times 
-        # layers.append(BasicBlock(inplane = 16, planes = 32 , 1)) => self.in_planes = planes = 32 => padding occurs => layers.append(BasicBlock(inplane = 32, planes = 32 , 1)) repeat 4 times
-        # layers.append(BasicBlock(inplane = 32, planes = 64 , 1)) => self.in_planes = planes = 64 => padding occurs => layers.append(BasicBlock(inplane = 64, planes = 64 , 1)) repeat 4 times
-
-    def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        out = F.avg_pool2d(out, out.size()[3])
-        out = out.view(out.size(0), -1)
-        out = self.linear(out)
-        return out
+    fc_h = tf.matmul(input_layer, fc_w) + fc_b
+    return fc_h
 
 
-def resnet20():
-    return ResNet(BasicBlock, [3, 3, 3])
+def batch_normalization_layer(input_layer, dimension):
+    '''
+    Helper function to do batch normalziation
+    :param input_layer: 4D tensor
+    :param dimension: input_layer.get_shape().as_list()[-1]. The depth of the 4D tensor
+    :return: the 4D tensor after being normalized
+    '''
+    mean, variance = tf.nn.moments(input_layer, axes=[0, 1, 2])
+    beta = tf.get_variable('beta', dimension, tf.float32,
+                               initializer=tf.constant_initializer(0.0, tf.float32))
+    gamma = tf.get_variable('gamma', dimension, tf.float32,
+                                initializer=tf.constant_initializer(1.0, tf.float32))
+    bn_layer = tf.nn.batch_normalization(input_layer, mean, variance, beta, gamma, BN_EPSILON)
+
+    return bn_layer
 
 
-def resnet32():
-    return ResNet(BasicBlock, [5, 5, 5])
+def conv_bn_relu_layer(input_layer, filter_shape, stride):
+    '''
+    A helper function to conv, batch normalize and relu the input tensor sequentially
+    :param input_layer: 4D tensor
+    :param filter_shape: list. [filter_height, filter_width, filter_depth, filter_number]
+    :param stride: stride size for conv
+    :return: 4D tensor. Y = Relu(batch_normalize(conv(X)))
+    '''
+
+    out_channel = filter_shape[-1]
+    filter = create_variables(name='conv', shape=filter_shape)
+
+    conv_layer = tf.nn.conv2d(input_layer, filter, strides=[1, stride, stride, 1], padding='SAME')
+    bn_layer = batch_normalization_layer(conv_layer, out_channel)
+
+    output = tf.nn.relu(bn_layer)
+    return output
 
 
-def resnet44():
-    return ResNet(BasicBlock, [7, 7, 7])
+def bn_relu_conv_layer(input_layer, filter_shape, stride):
+    '''
+    A helper function to batch normalize, relu and conv the input layer sequentially
+    :param input_layer: 4D tensor
+    :param filter_shape: list. [filter_height, filter_width, filter_depth, filter_number]
+    :param stride: stride size for conv
+    :return: 4D tensor. Y = conv(Relu(batch_normalize(X)))
+    '''
+
+    in_channel = input_layer.get_shape().as_list()[-1]
+
+    bn_layer = batch_normalization_layer(input_layer, in_channel)
+    relu_layer = tf.nn.relu(bn_layer)
+
+    filter = create_variables(name='conv', shape=filter_shape)
+    conv_layer = tf.nn.conv2d(relu_layer, filter, strides=[1, stride, stride, 1], padding='SAME')
+    return conv_layer
 
 
-def resnet56():
-    return ResNet(BasicBlock, [9, 9, 9])
+
+def residual_block(input_layer, output_channel, first_block=False):
+    '''
+    Defines a residual block in ResNet
+    :param input_layer: 4D tensor
+    :param output_channel: int. return_tensor.get_shape().as_list()[-1] = output_channel
+    :param first_block: if this is the first residual block of the whole network
+    :return: 4D tensor.
+    '''
+    input_channel = input_layer.get_shape().as_list()[-1]
+
+    # When it's time to "shrink" the image size, we use stride = 2
+    if input_channel * 2 == output_channel:
+        increase_dim = True
+        stride = 2
+    elif input_channel == output_channel:
+        increase_dim = False
+        stride = 1
+    else:
+        raise ValueError('Output and input channel does not match in residual blocks!!!')
+
+    # The first conv layer of the first residual block does not need to be normalized and relu-ed.
+    with tf.variable_scope('conv1_in_block'):
+        if first_block:
+            filter = create_variables(name='conv', shape=[3, 3, input_channel, output_channel])
+            conv1 = tf.nn.conv2d(input_layer, filter=filter, strides=[1, 1, 1, 1], padding='SAME')
+        else:
+            conv1 = bn_relu_conv_layer(input_layer, [3, 3, input_channel, output_channel], stride)
+
+    with tf.variable_scope('conv2_in_block'):
+        conv2 = bn_relu_conv_layer(conv1, [3, 3, output_channel, output_channel], 1)
+
+    # When the channels of input layer and conv2 does not match, we add zero pads to increase the
+    #  depth of input layers
+    if increase_dim is True:
+        pooled_input = tf.nn.avg_pool(input_layer, ksize=[1, 2, 2, 1],
+                                      strides=[1, 2, 2, 1], padding='VALID')
+        padded_input = tf.pad(pooled_input, [[0, 0], [0, 0], [0, 0], [input_channel // 2,
+                                                                     input_channel // 2]])
+    else:
+        padded_input = input_layer
+
+    output = conv2 + padded_input
+    return output
 
 
-def resnet110():
-    return ResNet(BasicBlock, [18, 18, 18])
+def inference(input_tensor_batch, n, reuse):
+    '''
+    The main function that defines the ResNet. total layers = 1 + 2n + 2n + 2n +1 = 6n + 2
+    :param input_tensor_batch: 4D tensor
+    :param n: num_residual_blocks
+    :param reuse: To build train graph, reuse=False. To build validation graph and share weights
+    with train graph, resue=True
+    :return: last layer in the network. Not softmax-ed
+    '''
+
+    layers = []
+    with tf.variable_scope('conv0', reuse=reuse):
+        # fully connect conv layer > batch normalize > relu
+        conv0 = conv_bn_relu_layer(input_tensor_batch, [3, 3, 3, 16], 1)
+        activation_summary(conv0)
+        layers.append(conv0)
+
+    for i in range(n):
+        #first residual layer
+        with tf.variable_scope('conv1_%d' %i, reuse=reuse):
+            if i == 0:
+                conv1 = residual_block(layers[-1], 16, first_block=True)
+            else:
+                conv1 = residual_block(layers[-1], 16)
+            activation_summary(conv1)
+            layers.append(conv1)
+
+    for i in range(n):
+        #second residual layer
+        with tf.variable_scope('conv2_%d' %i, reuse=reuse):
+            conv2 = residual_block(layers[-1], 32)
+            activation_summary(conv2)
+            layers.append(conv2)
+
+    for i in range(n):
+        #third residual layer
+        with tf.variable_scope('conv3_%d' %i, reuse=reuse):
+            conv3 = residual_block(layers[-1], 64)
+            layers.append(conv3)
+        assert conv3.get_shape().as_list()[1:] == [8, 8, 64]
+
+    with tf.variable_scope('fc', reuse=reuse):
+        #fully connected linear layer
+        in_channel = layers[-1].get_shape().as_list()[-1]
+        bn_layer = batch_normalization_layer(layers[-1], in_channel)
+        relu_layer = tf.nn.relu(bn_layer)
+
+        #https://stackoverflow.com/questions/42054451/how-do-i-do-global-average-pooling-in-tensorflow
+        #reduce_mean is alternative method to performing global pooling while maintaining num. out channels.
+        global_pool = tf.reduce_mean(relu_layer, [1, 2])
+
+        assert global_pool.get_shape().as_list()[-1:] == [64]
+        output = output_layer(global_pool, 10)
+        layers.append(output)
+
+    return layers[-1]
 
 
-def resnet1202():
-    return ResNet(BasicBlock, [200, 200, 200])
-
-
-def test(net):
-    import numpy as np
-    total_params = 0
-
-    for x in filter(lambda p: p.requires_grad, net.parameters()):
-        total_params += np.prod(x.data.numpy().shape)
-    print("Total number of params", total_params)
-    print("Total layers", len(list(filter(lambda p: p.requires_grad and len(p.data.size())>1, net.parameters()))))
-
-
-if __name__ == "__main__":
-    for net_name in __all__:
-        if net_name.startswith('resnet'):
-            print(net_name)
-            test(globals()[net_name]())
-            print()
+def test_graph(train_dir='logs'):
+    '''
+    Run this function to look at the graph structure on tensorboard. A fast way!
+    :param train_dir:
+    '''
+    input_tensor = tf.constant(np.ones([128, 32, 32, 3]), dtype=tf.float32)
+    result = inference(input_tensor, 2, reuse=False)
+    init = tf.initialize_all_variables()
+    sess = tf.Session()
+    sess.run(init)
+    summary_writer = tf.train.SummaryWriter(train_dir, sess.graph)
